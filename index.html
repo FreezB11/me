@@ -1,11 +1,196 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Yashraj Rao</title>
+
+<style>
+*{
+    margin:0;
+    padding:0;
+    box-sizing:border-box;
+}
+
+body{
+    background:#0d1117;
+    color:#e6edf3;
+    font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    line-height:1.7;
+}
+
+.container{
+    max-width:900px;
+    margin:auto;
+    padding:60px 25px;
+}
+
+header{
+    margin-bottom:60px;
+}
+
+h1{
+    font-size:3rem;
+}
+
+.subtitle{
+    color:#8b949e;
+    margin-top:8px;
+}
+
+.links{
+    margin-top:25px;
+}
+
+.links a{
+    color:#58a6ff;
+    text-decoration:none;
+    margin-right:20px;
+}
+
+.links a:hover{
+    text-decoration:underline;
+}
+
+section{
+    margin-bottom:60px;
+}
+
+h2{
+    margin-bottom:18px;
+    border-bottom:1px solid #30363d;
+    padding-bottom:8px;
+}
+
+.blog-list{
+    display:flex;
+    flex-direction:column;
+    gap:18px;
+}
+
+.post{
+    padding:18px;
+    border:1px solid #30363d;
+    border-radius:10px;
+    transition:.2s;
+}
+
+.post:hover{
+    border-color:#58a6ff;
+}
+
+.post a{
+    color:white;
+    text-decoration:none;
+    font-size:1.2rem;
+    font-weight:bold;
+}
+
+.date{
+    color:#8b949e;
+    font-size:.9rem;
+    margin-bottom:8px;
+}
+
+.desc{
+    color:#c9d1d9;
+}
+
+footer{
+    margin-top:80px;
+    color:#8b949e;
+    font-size:.9rem;
+    text-align:center;
+}
+</style>
 </head>
+
 <body>
-    test
+
+<div class="container">
+
+<header>
+
+<h1>Yashraj Rao</h1>
+
+<p class="subtitle">
+Systems Programming • Distributed Systems • Networking • C/C++
+</p>
+
+<div class="links">
+<a href="https://github.com/yourusername">GitHub</a>
+<a href="#">LinkedIn</a>
+<a href="#">X</a>
+</div>
+
+</header>
+
+<section>
+
+<h2>About</h2>
+
+<p>
+Hi, I'm Yashraj. I enjoy building low-level software—from networking stacks and
+distributed systems to operating-system components. This site documents what I
+build, what I learn, and the engineering decisions behind each project.
+</p>
+
+</section>
+
+<section>
+
+<h2>Latest Writing</h2>
+
+<div class="blog-list">
+
+<div class="post">
+<div class="date">July 2026</div>
+
+<a href="blogs/quic-lite.html">
+Building QUIC-lite
+</a>
+
+<div class="desc">
+Implementing a lightweight QUIC library from scratch.
+</div>
+</div>
+
+<div class="post">
+<div class="date">July 2026</div>
+
+<a href="blogs/nat-hole-punching.html">
+How NAT Hole Punching Actually Works
+</a>
+
+<div class="desc">
+A practical walkthrough of peer-to-peer networking.
+</div>
+</div>
+
+<div class="post">
+<div class="date">June 2026</div>
+
+<a href="blogs/thread-scheduler.html">
+Writing a User-Level Thread Scheduler
+</a>
+
+<div class="desc">
+Context switching, cooperative scheduling, and work queues.
+</div>
+</div>
+
+</div>
+
+</section>
+
+<footer>
+
+Made with HTML • Hosted on GitHub Pages
+
+</footer>
+
+</div>
+
 </body>
 </html>
