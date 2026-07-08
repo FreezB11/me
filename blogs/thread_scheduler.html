@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Writing a User-Level Thread Scheduler</title>
+
+<style>
+*{
+    margin:0;
+    padding:0;
+    box-sizing:border-box;
+}
+
+body{
+    background:#0d1117;
+    color:#e6edf3;
+    font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    line-height:1.8;
+}
+
+.container{
+    max-width:850px;
+    margin:auto;
+    padding:60px 25px;
+}
+
+a{
+    color:#58a6ff;
+    text-decoration:none;
+}
+
+a:hover{
+    text-decoration:underline;
+}
+
+header{
+    margin-bottom:60px;
+}
+
+h1{
+    font-size:2.8rem;
+    margin-bottom:10px;
+}
+
+.date{
+    color:#8b949e;
+    margin-bottom:20px;
+}
+
+.subtitle{
+    color:#c9d1d9;
+    font-size:1.1rem;
+}
+
+h2{
+    margin-top:55px;
+    margin-bottom:20px;
+    border-bottom:1px solid #30363d;
+    padding-bottom:8px;
+}
+
+p{
+    margin-bottom:20px;
+}
+
+pre{
+    background:#161b22;
+    padding:18px;
+    border-radius:8px;
+    overflow-x:auto;
+    margin:25px 0;
+}
+
+code{
+    font-family:Consolas, monospace;
+}
+
+blockquote{
+    border-left:4px solid #58a6ff;
+    padding-left:18px;
+    color:#c9d1d9;
+    margin:25px 0;
+}
+
+ul{
+    padding-left:20px;
+}
+
+li{
+    margin:10px 0;
+}
+
+footer{
+    margin-top:80px;
+    color:#8b949e;
+    text-align:center;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<a href="../index.html">← Back to Home</a>
+
+<header>
+
+<h1>Writing a User-Level Thread Scheduler</h1>
+
+<div class="date">
+June 2026 • Systems Programming
+</div>
+
+<p class="subtitle">
+How I built a lightweight cooperative scheduler from scratch in C and what I
+learned about context switching, stack management, and scheduling.
+</p>
+
+</header>
+
+<h2>Motivation</h2>
+
+<p>
+Most programmers interact with threads through libraries like pthreads and never
+see what happens underneath. I wanted to understand how an operating system—or a
+runtime like Go—actually switches execution from one thread to another.
+</p>
+
+<p>
+Rather than reading only documentation, I decided to build a scheduler myself.
+The goal wasn't performance; it was understanding.
+</p>
+
+<h2>Project Goals</h2>
+
+<ul>
+<li>Implement user-space threads.</li>
+<li>Perform context switching without kernel involvement.</li>
+<li>Maintain separate stacks for each thread.</li>
+<li>Implement a simple round-robin scheduler.</li>
+<li>Eventually support sleeping, yielding, and synchronization.</li>
+</ul>
+
+<h2>The Core Idea</h2>
+
+<p>
+A thread is essentially two things:
+</p>
+
+<ul>
+<li>An execution context (registers).</li>
+<li>A stack.</li>
+</ul>
+
+<p>
+If both can be saved and restored, execution can resume exactly where it left
+off.
+</p>
+
+<pre><code>Thread
+ ├── Registers
+ ├── Stack Pointer
+ ├── Program Counter
+ ├── State
+ └── Stack Memory</code></pre>
+
+<h2>Context Switching</h2>
+
+<p>
+The scheduler saves the CPU state of the currently running thread before loading
+the saved state of another thread.
+</p>
+
+<pre><code>Thread A
+
+RIP = 0x401245
+RSP = 0x7ffd...
+
+↓
+
+Save Registers
+
+↓
+
+Load Thread B Registers
+
+↓
+
+Continue Execution</code></pre>
+
+<p>
+From the perspective of Thread B, nothing unusual happened—it simply continues
+executing after its previous yield.
+</p>
+
+<h2>Scheduler</h2>
+
+<p>
+Initially, the scheduler follows a simple round-robin policy.
+</p>
+
+<pre><code>while (true) {
+
+    current = next_thread();
+
+    context_switch(current);
+
+}</code></pre>
+
+<p>
+This guarantees fairness while keeping the implementation simple.
+</p>
+
+<h2>Stack Allocation</h2>
+
+<p>
+Each thread owns a dedicated stack allocated with <code>malloc()</code>. When a
+new thread is created, the initial stack is prepared so that the first context
+switch begins executing the target function.
+</p>
+
+<pre><code>+----------------------+
+| Thread Function      |
++----------------------+
+| Return Address       |
++----------------------+
+| Saved Registers      |
++----------------------+
+| Stack grows ↓        |
+</code></pre>
+
+<h2>Challenges</h2>
+
+<p>
+The most difficult part wasn't writing the scheduler—it was debugging incorrect
+stack layouts. A single mistake in stack alignment or register restoration often
+resulted in immediate segmentation faults.
+</p>
+
+<p>
+These bugs forced me to better understand the calling convention and how function
+prologues interact with manually constructed stacks.
+</p>
+
+<h2>Lessons Learned</h2>
+
+<ul>
+<li>Threads are fundamentally saved CPU state plus memory.</li>
+<li>Context switching is surprisingly small once the assembly is understood.</li>
+<li>Schedulers are simple until blocking, synchronization, and priorities are
+introduced.</li>
+<li>Debugging low-level code requires patience and careful reasoning.</li>
+</ul>
+
+<h2>Future Improvements</h2>
+
+<ul>
+<li>Preemptive scheduling using timer interrupts.</li>
+<li>Priority queues.</li>
+<li>Sleeping threads.</li>
+<li>Mutexes and condition variables.</li>
+<li>Work-stealing scheduler.</li>
+<li>Multi-core execution.</li>
+</ul>
+
+<h2>Conclusion</h2>
+
+<p>
+Building a scheduler from scratch gave me a much deeper appreciation for runtime
+systems. Although the implementation is small compared to a production runtime,
+the same ideas appear in operating systems, language runtimes, game engines, and
+high-performance servers.
+</p>
+
+<footer>
+
+© 2026 Yashraj Rao
+
+</footer>
+
+</div>
+
+</body>
+</html>
