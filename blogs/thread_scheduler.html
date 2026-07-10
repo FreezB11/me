@@ -2,9 +2,31 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Thread Scheduler</title>
+    <title>How Fast Can a Context Switch Go?</title>
 
     <link rel="stylesheet" href="../css/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+    <style>
+        /* Bring Prism's theme in line with the site's own bg/border tokens
+           instead of the default prism-tomorrow slate, so code blocks don't
+           visually clash with the rest of the page. */
+        pre[class*="language-"] {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+        }
+        code[class*="language-"],
+        pre[class*="language-"] {
+            font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+            font-size: 0.95rem;
+            text-shadow: none;
+        }
+        :not(pre) > code[class*="language-"] {
+            background: rgba(255,255,255,0.05);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+    </style>
 </head>
 <body>
 
@@ -12,11 +34,468 @@
 
 <a href="../index.html">← Home</a>
 
-<h1>Writing a User-Level Thread Scheduler</h1>
+<h1>How Fast Can a Context Switch Go?</h1>
 
 <p class="date">July 2026</p>
 
+<p>
+I'm building a user-level thread scheduler &mdash; cooperative threads that
+live entirely in userspace, with no kernel involvement, that hand control to
+each other explicitly instead of being preempted by a timer. The core of
+that is a function that swaps which thread the CPU is currently running:
+save one thread's state, load another's, keep going. That function is maybe
+ten lines of assembly.
+</p>
+
+<p>
+I got it working, ran it once just to see a number, and got nerd-sniped.
+11.51 nanoseconds per switch. Is that fast? Slow? What's actually taking that
+long? I put the scheduler down and spent the next while chasing that one
+number instead &mdash; trimming registers, fixing a broken benchmark, and
+eventually hitting a CPU exception I still can't fully explain.
+</p>
+
+<p>
+This post is that detour, not the scheduler. If you're new to this level of
+the stack, I'll explain the concepts as they come up &mdash; you don't need
+to have written assembly before to follow along.
+</p>
+
+<h2>What actually needs to move</h2>
+
+<p>
+Every running program has some state that lives entirely inside the CPU, not
+in memory &mdash; a handful of <em>registers</em> it's using as scratch
+space, plus one register that points at where the next instruction lives and
+another that points at the current stack. A context switch is just: write
+all of that down somewhere, load a different program's saved values into
+those same registers, and carry on. The CPU doesn't know or care that it
+just became a different thread &mdash; it only ever sees "next instruction,
+current registers."
+</p>
+
+<p>
+That sounds like it should involve a lot of state to save. In practice,
+for two cooperative user-level threads that never touch floating point, it's
+almost nothing. Here's the x86-64 register file and what each one is for:
+</p>
+
+<table>
+<thead>
+<tr>
+    <th>Register</th>
+    <th>Role</th>
+    <th>Do I need to save it?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+    <td><code>rip</code></td>
+    <td>instruction pointer &mdash; where execution resumes</td>
+    <td><strong>yes</strong></td>
+</tr>
+<tr>
+    <td><code>rsp</code></td>
+    <td>stack pointer &mdash; which stack we're running on</td>
+    <td><strong>yes</strong></td>
+</tr>
+<tr>
+    <td><code>rbp</code></td>
+    <td>frame pointer (by convention, not hardware-enforced)</td>
+    <td>yes, callee-saved</td>
+</tr>
+<tr>
+    <td><code>rbx</code></td>
+    <td>general purpose, callee-saved</td>
+    <td>yes, callee-saved</td>
+</tr>
+<tr>
+    <td><code>r12</code>&ndash;<code>r15</code></td>
+    <td>general purpose, callee-saved</td>
+    <td>only if you actually use them</td>
+</tr>
+<tr>
+    <td><code>rflags</code></td>
+    <td>condition codes &mdash; carry, zero, sign, overflow, etc, set by arithmetic/compare instructions and read by conditional jumps</td>
+    <td>almost never, see below</td>
+</tr>
+<tr>
+    <td><code>rax</code>, <code>rcx</code>, <code>rdx</code>, <code>rsi</code>, <code>rdi</code>, <code>r8</code>&ndash;<code>r11</code></td>
+    <td>caller-saved (argument/return/scratch registers)</td>
+    <td><strong>no</strong> &mdash; the C calling convention already guarantees these are dead across a function call</td>
+</tr>
+<tr>
+    <td><code>xmm0</code>&ndash;<code>xmm15</code></td>
+    <td>floating point / SIMD</td>
+    <td>only if the switched code touches floats</td>
+</tr>
+<tr>
+    <td><code>fs</code></td>
+    <td>thread-local storage base</td>
+    <td>only if you have per-thread TLS</td>
+</tr>
+</tbody>
+</table>
+
+<p>
+<strong>Why <code>rflags</code> almost never needs saving:</strong>
+it's
+volatile on a timescale of single instructions. Any arithmetic or compare
+instruction overwrites it, and the C calling convention makes no promise that
+it survives a function call &mdash; the compiler never assumes flags are live
+across a <code>call</code>, because it has no way to know what the callee did
+internally. By the time <code>ctx_switch</code> returns into either thread,
+whatever code runs next is going to execute its own compare or arithmetic
+instruction before it branches on flags for anything meaningful, which
+overwrites them anyway. The one case where you'd actually need
+<code>pushfq</code> / <code>popfq</code> here is if you're switching in the
+middle of an instruction sequence that depends on a flag set by something
+that hasn't executed its next branch yet &mdash; which cooperative,
+function-call-boundary switching by construction never does, since
+<code>ctx_switch</code> is only ever entered and exited at a call/return
+boundary, never mid-sequence.
+</p>
+
+<p>
+That caller-saved/callee-saved distinction is the one that makes the whole
+thing cheap: <strong>caller-saved registers don't need to be part of the
+context at all.</strong> <code>ctx_switch</code> is just a normal C function
+as far as the calling convention is concerned. Any caller that had something
+live in <code>rax</code> or <code>rdi</code> across the call already knows
+the compiler would have clobbered those anyway &mdash; that's what
+"caller-saved" means. The compiler on the calling side has already spilled
+anything it cared about before the <code>call</code> instruction executes.
+We only owe the callee-saved set: <code>rbx</code>, <code>rbp</code>,
+<code>r12</code>&ndash;<code>r15</code>.
+</p>
+
+<p>
+So a <em>minimal</em> switch between two threads that only run integer code
+needs:
+</p>
+
+<ul>
+    <li><code>rip</code> and <code>rsp</code> &mdash; because these define what "the thread" even is</li>
+    <li><code>rbp</code>, <code>rbx</code> &mdash; callee-saved, ABI obligation</li>
+    <li><code>r12</code>&ndash;<code>r15</code> &mdash; callee-saved, but only if something is actually using them</li>
+</ul>
+
+<p>
+That's it. No <code>rax</code>, no <code>rflags</code> in most cases, no
+FPU/SSE state unless the switched code does floating point. Here's the struct
+that holds it:
+</p>
+
+<pre><code class="language-c">typedef struct context_t {
+    /*
+    rax 
+    rip -> instruction pointer where the task resumes.
+    rbx -> calle-saved register; optinally used as base pointer
+    rcx -> used to pass 4th arg to func, loop counter
+    rdx -> used to pass 3rd arg to func, 2nd return register for 128bit returns (rdx:rax)
+    rsp -> stack pointer
+    rbp -> calle-saved register; optionally used as frame ptr
+    rsi -> used to pass 2nd arg to func; source index
+    rdi -> used to pass 1st arg to func; destination index
+    r8 -> used to pass 5th arg to func
+    r9 -> used to pass 6th arg to func
+    r10 -> tmp reg; used to passing func;s static chain ptr
+    r11 -> tmp register
+    r12-r15 -> calle-saved register
+    xmm0-xmm1 -> used to pass & return floating point arg
+    xmm2-xmm7 -> used to pass floating point arg
+    xmm8-xmm15 -> tmp register
+    mmx0-mmx7 -> tmp register
+    st0,st1 -> tmp register; used to return long double arg
+    st2-st7 -> tmp register;
+    fs -> reserved for system(as thread specific data reg)
+    mxcsr -> sse2 control and status word
+    x87 sw -> status word
+    x87 cw -> control word
+    */
+    uint64_t rip; // where to resume
+    uint64_t rsp; // stack top
+    uint64_t rbp; // frame base
+    uint64_t rbx; // callee-saved
+} context_t;</code></pre>
+
+<h2>The switch itself</h2>
+
+<pre><code class="language-nasm">.globl ctx_switch
+.globl ctx_switch
+.type ctx_switch, @function
+ctx_switch:
+    /* rdi -> old context */
+    /* rsi -> new context */
+    /* the `call` instruction that invoked this function pushed
+    the return address (rip) onto the stack. we read it from (%rsp)*/
+    movq (%rsp), %rax
+    movq %rax, 0(%rdi) /* rip */
+
+    leaq 8(%rsp), %rax
+    movq %rax, 8(%rdi) /* rsp: save pre-call rsp (rsp+8), not rsp which points AT the return addr */
+
+    /*movq %rsp, 8(%rdi) rsp */
+    movq %rbp, 16(%rdi)/* rbp */
+    movq %rbx, 24(%rdi) /* rbx */
+
+    /* load the context to the regis */
+    movq 24(%rsi), %rbx
+    movq 16(%rsi), %rbp
+
+    movq 8(%rsi), %rsp
+
+    pushq 0(%rsi)
+    ret
+
+</code></pre>
+
+<p>
+Two things worth slowing down on, because they're the whole trick:
+</p>
+
+<p>
+<strong>Saving <code>rip</code> without an explicit "get current instruction
+pointer" instruction.</strong> x86-64 doesn't have one in user mode. But
+<code>ctx_switch</code> was reached via <code>call ctx_switch</code>, and
+<code>call</code> pushes the return address onto the stack before jumping.
+So <code>(%rsp)</code> &mdash; the top of the stack, right now, before we
+touch anything &mdash; already <em>is</em> the address we need to resume at.
+We just read it back out.
+</p>
+
+<p>
+<strong>Resuming via <code>pushq</code>+<code>ret</code> instead of
+<code>jmp</code>.</strong> Once <code>rsp</code> has been swapped to the
+other thread's stack, we push that thread's saved <code>rip</code> onto its
+own stack and <code>ret</code>. <code>ret</code> pops an address and jumps to
+it &mdash; so this behaves exactly like returning from a function call,
+except the "function" we're returning into is wherever that thread was last
+suspended. The alternative &mdash; loading <code>rip</code> into a register
+and <code>jmp *%rax</code> &mdash; works too, but skips the CPU's
+return-address predictor (the RSB), which is tuned specifically for the
+push-then-ret pattern. Every real coroutine library (boost.context, libco,
+etc.) uses this exact trick for that reason.
+</p>
+
+<p>
+One asymmetry to notice: the <em>first</em> time a thread runs, there's no
+"suspended state" to resume &mdash; it needs to start at a function entry
+point, not return into the middle of one. That's what <code>init_task</code>
+sets up: it manually writes a <code>context_t</code> that looks like what
+<code>ctx_switch</code> would have saved if the thread had been suspended one
+instruction before its own start, sitting on a stack laid out to match.
+</p>
+
+<pre><code class="language-c">void init_task(context_t* ctx, void (*func)(), void* stack, size_t stack_size) {
+    uint64_t* stack_top = (uint64_t*)((uint8_t*)stack + stack_size);
+    stack_top = (uint64_t*)((uintptr_t)stack_top & ~0xF);  // 16-byte align
+    stack_top--;
+    *stack_top = 0;              // dummy return address; func() never returns
+
+    ctx->rip = (uint64_t)func;
+    ctx->rsp = (uint64_t)stack_top;
+    ctx->rbp = 0;
+    ctx->rbx = 0;
+}</code></pre>
+
+<h3>The Switching code</h3>
+<pre><code class="language-c">
+// //gcc -g -fno-omit-frame-pointer main.c context_s.o -o main
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
+#include "arch/x86_64/context.h"
+
+context_t main_ctx;
+context_t task_ctx;
+
+void task_function() {
+    while (1) {
+        ctx_switch(&task_ctx, &main_ctx);
+    }
+}
+
+uint8_t task_stack[4096];
+
+void init_task(context_t* ctx, void (*func)(), void* stack, size_t stack_size) {
+    uint64_t* stack_top = (uint64_t*)((uint8_t*)stack + stack_size);
+    stack_top = (uint64_t*)((uintptr_t)stack_top & ~0xF);
+    stack_top--;
+    *stack_top = 0;
+
+    ctx->rip = (uint64_t)func;
+    ctx->rsp = (uint64_t)stack_top;
+    ctx->rbp = 0;
+    ctx->rbx = 0;
+    // ctx->rflags = 0x202;
+}
+
+// static volatile int stop = 0;
+static int stop = 0;
+
+void alarm_handler(int sig) {
+    stop = 1;  // set flag on SIGALRM, main loop checks it
+}
+
+int main() {
+    init_task(&task_ctx, task_function, task_stack, sizeof(task_stack));
+
+    signal(SIGALRM, alarm_handler);
+    alarm(1);  // fire SIGALRM after 1 second
+
+    long long count = 0;
+
+    while (!stop) {
+        ctx_switch(&main_ctx, &task_ctx);
+        count++;
+    }
+
+    // task_function is still alive in its infinite loop, no need to touch it
+
+    printf("Round trips (main<->task) : %lld\n", count);
+    printf("Total context switches    : %lld\n", count * 2);
+    printf("Avg per switch            : %.2f ns\n", 1e9 / (double)(count * 2));
+
+    return 0;
+}
+//taskset -c 0 ./main
+</code></pre>
+
+<h2>The first numbers</h2>
+
+<p>
+Wired up between a <code>main</code> loop and a task that just switches
+straight back, round-tripping as fast as possible for one second:
+</p>
+
+<pre><code class="language-bash">Round trips (main&lt;-&gt;task) : 43457474
+Total context switches    : 86914948
+Avg per switch            : 11.51 ns</code></pre>
+
+<p>
+11.51 ns. On a modern core that's somewhere around 30&ndash;40 cycles for
+what is, at the assembly level, eight instructions and two branches (the
+<code>call</code> on the way in, the <code>ret</code> on the way out). That
+felt slow enough to be worth questioning &mdash; and shallow enough as a
+benchmark that the number turned out to be measuring the wrong things almost
+as much as it was measuring the switch.
+</p>
+
+<h2>Asking the CPU directly</h2>
+ 
+<p>
+Instead of guessing at what those 30-odd cycles are doing, <code>perf
+stat</code> will just tell us &mdash; it reads the CPU's own hardware
+performance counters while your program runs, so instead of a stopwatch
+number you get things like "how many instructions actually retired" and
+"how often did a branch prediction turn out wrong."
+</p>
+ 
+<pre><code class="language-bash">perf stat -e cycles,instructions,branches,branch-misses taskset -c 0 ./main
+
+Round trips (main&lt;-&gt;task) : 43564406
+Total context switches    : 87128812
+Avg per switch            : 11.48 ns
+ 
+ Performance counter stats for 'taskset -c 0 ./main':
+ 
+     1,055,161,771      cpu_atom/cycles/u                                                       (0.04%)
+     3,761,646,504      cpu_core/cycles/u                                                       (99.96%)
+       545,302,067      cpu_atom/instructions/u                                                 (0.04%)
+     1,438,358,357      cpu_core/instructions/u                                                 (99.96%)
+       119,532,209      cpu_atom/branches/u                                                     (0.04%)
+       261,526,087      cpu_core/branches/u                                                     (99.96%)
+         7,821,005      cpu_atom/branch-misses/u                                                (0.04%)
+        87,167,146      cpu_core/branch-misses/u                                                (99.96%)
+ 
+       1.001344809 seconds time elapsed
+       0.992575000 seconds user
+       0.001905000 seconds sys</code></pre>
+ 
+<p>
+First thing to notice, if you haven't seen this before: every counter is
+split into <code>cpu_atom</code> and <code>cpu_core</code>. That's not a perf
+quirk &mdash; it means this is a hybrid CPU<code>(i am on intel i5-13450hx)</code> with two different kinds of
+cores on the same die (Intel calls them P-cores and E-cores; "atom" and
+"core" are perf's names for the same split). <code>taskset -c 0</code> pins
+the process to logical CPU 0, but it doesn't tell you which physical core
+type that maps to, and the counter names are telling you: almost everything
+landed on <code>cpu_core</code> (the 99.96% next to each line is perf's
+confidence that the count is complete and not multiplexed away) &mdash; so
+this run executed on a P-core, and the tiny <code>cpu_atom</code> numbers are
+noise from something else briefly scheduled onto an E-core during the same
+second. Worth knowing before trusting any single-run number on a hybrid
+chip: which core type you land on isn't guaranteed just because you picked
+"CPU 0."
+</p>
+ 
+<p>
+Taking the <code>cpu_core</code> row as the real numbers: <strong>1.44
+billion instructions in 3.76 billion cycles</strong> is an IPC (instructions
+per cycle) of about 0.38. That's low &mdash; a modern out-of-order core can
+retire multiple instructions per cycle when things are going well, so 0.38
+means the pipeline is spending most of its time stalled, not executing.
+</p>
+ 
+<p>
+The branch numbers explain why. <strong>87,167,146 branch misses out of
+261,526,087 branches is a 33% misprediction rate</strong> &mdash; roughly
+one in three branches guessed wrong. For a tight loop with only two branches
+per switch (the <code>call</code> into <code>ctx_switch</code>, and the
+<code>ret</code> back out), that's a strong signal that the RSB &mdash; the
+small stack of predicted return addresses the CPU keeps internally &mdash;
+is being defeated. Every switch <code>ret</code>s to a <em>different</em>
+place than the <code>call</code> that would normally pair with it (main
+calls in, but the code path that eventually returns is on the task's own
+stack, and vice versa), so the predictor's assumption that <code>call</code>
+and <code>ret</code> nest like a normal function stack breaks down exactly
+the way you'd expect once you're bouncing between two independent stacks
+instead of staying on one.
+</p>
+ 
+<p>
+Cache behavior, by contrast, was a non-issue:
+</p>
+ 
+<pre><code class="language-bash">perf stat -e L1-dcache-loads,L1-dcache-load-misses,L1-icache-load-misses,dTLB-load-misses taskset -c 0 ./main
+    
+Round trips (main&lt;-&gt;task) : 43743436
+Total context switches    : 87486872
+Avg per switch            : 11.43 ns
+ 
+ Performance counter stats for 'taskset -c 0 ./main':
+ 
+                 0      cpu_atom/L1-dcache-loads/u                                              (0.01%)
+       568,803,168      cpu_core/L1-dcache-loads/u                                              (99.99%)
+   &lt;not supported&gt;      cpu_atom/L1-dcache-load-misses/u
+             4,449      cpu_core/L1-dcache-load-misses/u                                        (99.99%)
+                 0      cpu_atom/L1-icache-load-misses/u                                        (0.01%)
+            16,286      cpu_core/L1-icache-load-misses/u                                        (99.99%)
+                 0      cpu_atom/dTLB-load-misses/u                                             (0.01%)
+               397      cpu_core/dTLB-load-misses/u                                             (99.99%)
+ 
+       1.001311632 seconds time elapsed
+       0.995956000 seconds user
+       0.001940000 seconds sys</code></pre>
+ 
+<p>
+4,449 L1 data-cache misses out of 568 million loads is effectively zero
+&mdash; about 0.0008%. That matches the earlier expectation: the whole
+<code>context_t</code> struct fits in a single 64-byte cache line, both
+structs together are a few hundred bytes, and that working set stays
+resident in L1 permanently across 87 million iterations. Same story for the
+instruction cache and the TLB &mdash; both negligible. Whatever is costing
+these ~43 cycles a switch, it isn't memory. It's the branch predictor losing
+its footing on every single <code>ret</code>.
+</p>
+
 </div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
 
 </body>
 </html>
